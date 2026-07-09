@@ -28,6 +28,18 @@ void normalize_angle(double& angle) {
     while (angle < -M_PI) angle += 2.0 * M_PI;
 }
 
+double deg_to_rad(double deg) {
+    return deg * M_PI / 180.0;
+}
+
+double rad_to_deg(double rad) {
+    return rad * 180.0 / M_PI;
+}
+
+double clamp_value(double value, double min_value, double max_value) {
+    return std::max(min_value, std::min(max_value, value));
+}
+
 class KalmanFilter2D {
 public:
     double dt;
@@ -119,23 +131,30 @@ public:
                  double goal_distance_threshold,
                  double absolute_tracking_distance,
                  double goal_yaw_threshold_deg,
-                                 double max_fov_deg,
-                                 double body_y_deadzone_m,
-                                 double angle_follow_scale) 
+                 double normal_tracking_angle_deg,
+                 double position_limit_angle_deg,
+                 double turn_only_angle_deg,
+                 double turn_complete_body_yaw_threshold_deg,
+                 double body_y_deadzone_m,
+                 double angle_follow_scale)
         : base_url_(base_url),
           nav_pub_(nav_pub),
           max_nav_speed_m_s_(max_nav_speed_m_s),
           goal_publish_interval_sec_(goal_publish_interval_sec),
           goal_distance_threshold_(goal_distance_threshold),
           absolute_tracking_distance_(absolute_tracking_distance),
-          goal_yaw_threshold_rad_(goal_yaw_threshold_deg * M_PI / 180.0),
-          max_fov_deg_(max_fov_deg),
-                    body_y_deadzone_m_(body_y_deadzone_m),
-                    angle_follow_scale_(angle_follow_scale),
+          goal_yaw_threshold_rad_(deg_to_rad(goal_yaw_threshold_deg)),
+          normal_tracking_angle_deg_(normal_tracking_angle_deg),
+          position_limit_angle_rad_(deg_to_rad(position_limit_angle_deg)),
+          position_limit_angle_deg_(position_limit_angle_deg),
+          turn_only_angle_deg_(turn_only_angle_deg),
+          turn_complete_body_yaw_threshold_deg_(turn_complete_body_yaw_threshold_deg),
+          body_y_deadzone_m_(body_y_deadzone_m),
+          angle_follow_scale_(angle_follow_scale),
           is_running_(true),
           has_latest_goal_(false),
           has_published_goal_(false),
-                    nav_blocked_(false),
+          nav_blocked_(false),
           last_goal_process_time_(0),
           last_goal_publish_time_(0) {
         worker_thread_ = std::thread(&UwbApiClient::networkWorkerLoop, this);
@@ -305,36 +324,80 @@ private:
     }
 
     void processGoal(const BodyGoal& goal, const RobotPose& robot_pose) {
-        double body_y = goal.body_y;
-        if (std::abs(body_y) < body_y_deadzone_m_) {
-            body_y = 0.0;
-        }
-
-        double target_body_yaw = goal.body_yaw;
-        if (std::abs(target_body_yaw * 180.0 / M_PI) > max_fov_deg_) {
-            target_body_yaw *= angle_follow_scale_;
-        }
-
-        double target_world_x = robot_pose.x + goal.body_x * std::cos(robot_pose.yaw) - body_y * std::sin(robot_pose.yaw);
-        double target_world_y = robot_pose.y + goal.body_x * std::sin(robot_pose.yaw) + body_y * std::cos(robot_pose.yaw);
-        double target_world_yaw = robot_pose.yaw + target_body_yaw; 
-        normalize_angle(target_world_yaw);
-
         ros::Time now = ros::Time::now();
         double publish_elapsed = 0.0;
         if (has_published_goal_) {
             publish_elapsed = (now - last_goal_publish_time_).toSec();
-            if (publish_elapsed < goal_publish_interval_sec_) {
+        }
+
+        double body_yaw_deg = rad_to_deg(goal.body_yaw);
+        double abs_body_yaw_deg = std::abs(body_yaw_deg);
+        bool force_position_publish = false;
+
+        if (turn_only_active_) {
+            if (abs_body_yaw_deg > turn_complete_body_yaw_threshold_deg_) {
+                if (has_published_goal_ && publish_elapsed < goal_publish_interval_sec_) {
+                    return;
+                }
+                ROS_INFO_THROTTLE(1.0,
+                                  "等待UWB相对角收敛: 当前偏角 %.1f 度，暂不发布位置导航点。",
+                                  body_yaw_deg);
+                publishTurnOnlyGoal(goal, robot_pose, now);
                 return;
             }
+
+            turn_only_active_ = false;
+            force_position_publish = true;
+            ROS_INFO_THROTTLE(1.0,
+                              "UWB相对角已收敛: 当前偏角 %.1f 度，恢复位置导航点。",
+                              body_yaw_deg);
         }
+
+        if (abs_body_yaw_deg >= turn_only_angle_deg_) {
+            ROS_INFO_THROTTLE(1.0,
+                              "目标偏角过大 (%.1f 度)，进入原地转向，抑制横向位置点。",
+                              body_yaw_deg);
+            publishTurnOnlyGoal(goal, robot_pose, now);
+            return;
+        }
+
+        if (!force_position_publish && has_published_goal_ && publish_elapsed < goal_publish_interval_sec_) {
+            return;
+        }
+
+        double body_x = goal.body_x;
+        double body_y = goal.body_y;
+        bool is_position_angle_limited = false;
+        double goal_body_radius = std::hypot(goal.body_x, goal.body_y);
+
+        if (abs_body_yaw_deg >= normal_tracking_angle_deg_ && goal_body_radius > 1e-6) {
+            double limited_body_yaw = clamp_value(goal.body_yaw,
+                                                  -position_limit_angle_rad_,
+                                                  position_limit_angle_rad_);
+            body_x = goal_body_radius * std::cos(limited_body_yaw);
+            body_y = goal_body_radius * std::sin(limited_body_yaw);
+            is_position_angle_limited = true;
+        }
+
+        if (std::abs(body_y) < body_y_deadzone_m_) {
+            body_y = 0.0;
+        }
+
+        double target_world_x = robot_pose.x + body_x * std::cos(robot_pose.yaw) - body_y * std::sin(robot_pose.yaw);
+        double target_world_y = robot_pose.y + body_x * std::sin(robot_pose.yaw) + body_y * std::cos(robot_pose.yaw);
+        double target_body_yaw = 0.0;
+        if (abs_body_yaw_deg >= normal_tracking_angle_deg_) {
+            target_body_yaw = goal.body_yaw * angle_follow_scale_;
+        }
+        double target_world_yaw = robot_pose.yaw + target_body_yaw;
+        normalize_angle(target_world_yaw);
 
         double dist_to_last_goal = 0.0;
         if (has_published_goal_) {
             dist_to_last_goal = std::hypot(target_world_x - last_goal_world_x_, target_world_y - last_goal_world_y_);
             if (publish_elapsed > 0.0) {
                 double goal_speed = dist_to_last_goal / publish_elapsed;
-                if (goal_speed > max_nav_speed_m_s_) {
+                if (!skip_next_position_speed_check_ && goal_speed > max_nav_speed_m_s_) {
                     ROS_WARN_THROTTLE(1.0, "map导航点跳变过快 (%.2f m/s)，超限拦截！", goal_speed);
                     return;
                 }
@@ -347,21 +410,23 @@ private:
             normalize_angle(yaw_delta);
         }
 
-        double body_yaw_deg = goal.body_yaw * 180.0 / M_PI;
-        bool is_angle_out_of_bounds = std::abs(body_yaw_deg) > max_fov_deg_;
         bool tracking_distance_ok = goal.body_distance >= absolute_tracking_distance_;
-        bool is_distance_triggered = (!has_published_goal_ ||
+        bool is_distance_triggered = (skip_next_position_speed_check_ ||
+                                      !has_published_goal_ ||
                                       (tracking_distance_ok && dist_to_last_goal >= goal_distance_threshold_));
         bool is_angle_triggered = (!has_published_goal_ ||
-                                   (is_angle_out_of_bounds && std::abs(yaw_delta) >= goal_yaw_threshold_rad_));
+                                   (abs_body_yaw_deg >= normal_tracking_angle_deg_ &&
+                                    std::abs(yaw_delta) >= goal_yaw_threshold_rad_));
 
         if (!is_distance_triggered && !is_angle_triggered) {
             return;
         }
 
-        if (is_angle_out_of_bounds) {
-            //由于D1-O1+D1-O2转向超调过大，所以只能转一半角度
-            ROS_INFO_THROTTLE(1.0, "目标偏角过大 (%.1f 度)，触发转向跟随！", body_yaw_deg);
+        if (is_position_angle_limited) {
+            ROS_INFO_THROTTLE(1.0,
+                              "目标偏角 %.1f 度，位置点横向角限制到 %.1f 度以内。",
+                              body_yaw_deg,
+                              position_limit_angle_deg_);
         }
 
         if (publishAndSendGoal(target_world_x, target_world_y, target_world_yaw)) {
@@ -370,7 +435,27 @@ private:
             last_goal_world_yaw_ = target_world_yaw;
             last_goal_publish_time_ = now;
             has_published_goal_ = true;
+            skip_next_position_speed_check_ = false;
         }
+    }
+
+    bool publishTurnOnlyGoal(const BodyGoal& goal, const RobotPose& robot_pose, const ros::Time& now) {
+        double target_body_yaw = goal.body_yaw * angle_follow_scale_;
+        double target_world_yaw = robot_pose.yaw + target_body_yaw;
+        normalize_angle(target_world_yaw);
+
+        if (!publishAndSendGoal(robot_pose.x, robot_pose.y, target_world_yaw)) {
+            return false;
+        }
+
+        last_goal_world_x_ = robot_pose.x;
+        last_goal_world_y_ = robot_pose.y;
+        last_goal_world_yaw_ = target_world_yaw;
+        last_goal_publish_time_ = now;
+        has_published_goal_ = true;
+        turn_only_active_ = true;
+        skip_next_position_speed_check_ = true;
+        return true;
     }
 
     bool publishAndSendGoal(double world_x, double world_y, double final_yaw) {
@@ -415,7 +500,11 @@ private:
     double goal_distance_threshold_;
     double absolute_tracking_distance_;
     double goal_yaw_threshold_rad_;
-    double max_fov_deg_;
+    double normal_tracking_angle_deg_;
+    double position_limit_angle_rad_;
+    double position_limit_angle_deg_;
+    double turn_only_angle_deg_;
+    double turn_complete_body_yaw_threshold_deg_;
     double body_y_deadzone_m_;
     double angle_follow_scale_;
 
@@ -436,6 +525,8 @@ private:
     double last_goal_world_x_ = 0.0;
     double last_goal_world_y_ = 0.0;
     double last_goal_world_yaw_ = 0.0;
+    bool turn_only_active_ = false;
+    bool skip_next_position_speed_check_ = false;
 
 };
 
@@ -456,11 +547,14 @@ public:
             GOAL_DISTANCE_THRESHOLD,
             ABSOLUTE_TRACKING_DISTANCE,
             GOAL_YAW_THRESHOLD_DEG,
-            MAX_FOV_DEG,
+            NORMAL_TRACKING_ANGLE_DEG,
+            POSITION_LIMIT_ANGLE_DEG,
+            TURN_ONLY_ANGLE_DEG,
+            TURN_COMPLETE_BODY_YAW_THRESHOLD_DEG,
             BODY_Y_DEADZONE_M,
             ANGLE_FOLLOW_SCALE);
         
-        serial_fd_ = init_serial("/dev/ttyACM2");
+        serial_fd_ = init_serial("/dev/ttyACM1");
         if (serial_fd_ < 0) {
             ROS_ERROR("无法打开串口 /dev/ttyACM1");
             throw std::runtime_error("Serial port error");
@@ -487,15 +581,20 @@ private:
     std::shared_ptr<UwbApiClient> api_client_;
     
     // 追踪目标位置的状态变量
+    // 导航点的发布逻辑参数
     const double FOLLOW_DISTANCE = 1;             // 减去的跟随距离
-    const double GOAL_DISTANCE_THRESHOLD = 0.7;   // 距离上一次发布的坐标超过此阈值时更新
+    const double GOAL_DISTANCE_THRESHOLD = 0.5;  // 距离上一次发布的坐标超过此阈值时更新
     const double ABSOLUTE_TRACKING_DISTANCE = 1;  // 目标绝对距离大于此阈值时触发追踪
     const double GOAL_YAW_THRESHOLD_DEG = 3.0;    // 角度目标变化超过该值才重新下发
     const double GOAL_PUBLISH_INTERVAL_SEC = 0.33333333; // 每间隔多少秒发布一次导航点
     const double MAX_NAV_SPEED_M_S = 3.0;         // 导航点的最快速度
-    const double MAX_FOV_DEG = 30.0;              // 最大视场角，超过该角度的目标点会被抑制
-    const double BODY_Y_DEADZONE_M = 0.3;         // body坐标系下Y轴死区，抑制横向轻微抖动
-    const double ANGLE_FOLLOW_SCALE = 0.5;        // 角度过大时只跟随一半，降低超调
+    // 导航点的角度限制参数
+    const double NORMAL_TRACKING_ANGLE_DEG = 10.0; // 小角度内位置正常，目标yaw保持当前朝向，避免直线跟随摆头
+    const double POSITION_LIMIT_ANGLE_DEG = 5.0;  // 中等角度时位置点最大横向角
+    const double TURN_ONLY_ANGLE_DEG = 30.0;       // 超过该角度只原地转向，不发布横向位置点
+    const double TURN_COMPLETE_BODY_YAW_THRESHOLD_DEG = 10.0; // 最新UWB相对角小于该值时恢复位置导航点
+    const double BODY_Y_DEADZONE_M = 0.15;         // body坐标系下Y轴死区，抑制横向轻微抖动
+    const double ANGLE_FOLLOW_SCALE = 0.5;        // 角度过大时只跟随一半，降低超调（仅限于D1*2设备，换设备调回为1）
 
     int init_serial(const char* portname) {
         int fd = open(portname, O_RDWR | O_NOCTTY | O_SYNC);
